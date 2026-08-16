@@ -131,9 +131,16 @@ export default function createVideoGuard(pi: ExtensionAPI) {
         dialogue: Type.String({ minLength: 1, description: "Exact quoted dialogue or 'none'" }),
         sound: Type.String({ minLength: 1, description: "Ambience, synchronized SFX, and music progression" }),
         audioStartSeconds: Type.Optional(Type.Number({ minimum: 0, description: "Required source-audio in-point for each MV shot" })),
+        vocalPerformance: Type.Optional(Type.Object({
+          mode: StringEnum(["none", "singing"] as const, { description: "Required for every MV shot: none when no visible singer, singing when a visible subject performs the source vocal" }),
+          subjectId: Type.Optional(Type.String({ minLength: 1, description: "Required for singing; stable H3 subject id such as Subject 1" })),
+          speakerId: Type.Optional(Type.String({ minLength: 1, description: "Required for singing; stable H3 speaker id such as S1" })),
+          language: Type.Optional(Type.String({ minLength: 1, description: "Required for singing; original source-lyric language" })),
+          lyrics: Type.Optional(Type.String({ minLength: 1, description: "Required for singing; exact untranslated source lyrics for the H3 <d> block; use [unclear] rather than inventing words" })),
+        }, { description: "Required for every MV shot; singing fields are validated conditionally" })),
       }), { minItems: 1 }),
       continuityBible: Type.Unknown({ description: "JSON object locking geography/direction/props/costume plus storyboard_policy {mode: direct|selective|full, reason, storyboard_shot_ids}. Use direct for one unchanged scene, selective only for major scene/geography changes, and full only when explicitly or technically required. Also include style_bible {positive_prompt_prefix, negative_prompt, line_grammar, cel_shading, palette, background_rendering, contrast, color_temperature} and generation_lock {checkpoint, sampler, steps, cfg, resolution}." }),
-      audioPlan: Type.Unknown({ description: "JSON object for dialogue, ambience, SFX, and music" }),
+      audioPlan: Type.Unknown({ description: "JSON object for dialogue, ambience, SFX, and music. MV requires source_audio_usage='reference_only' and final_audio_policy='remux_original_source' because generated H3 audio is not the authoritative song master." }),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       const brief = productionBriefPayload(params);
@@ -171,11 +178,11 @@ export default function createVideoGuard(pi: ExtensionAPI) {
     name: "video_record_review",
     label: "Record visual review",
     description:
-      "Record a visual pass/fail only after inspecting every submitted artifact. Get the exact checklist from video_workflow status. Every required value is JSON boolean true/false; exact_character_count is a boolean match check, NEVER the number 1. Fail invalid art rather than retrying schemas or searching code.",
+      "Record a visual pass/fail only after inspecting every submitted artifact. Get the exact project-aware checklist from video_workflow status. MV singing clips add lyric, vocal-onset, M/B/P closure, rest-closure, mouth-visibility, and phrase-end checks; MV finals require original-song remux and timeline checks. Every required value is JSON boolean true/false; exact_character_count is a boolean match check, NEVER the number 1. Fail invalid art rather than retrying schemas or searching code.",
     parameters: Type.Object({
       stage: StringEnum(stages),
       verdict: StringEnum(verdicts),
-      checklistJson: Type.String({ description: "Copy required_checklist from video_workflow status. Every check is JSON boolean true/false; exact_character_count is boolean (true when count matches), never numeric. Storyboard passes additionally require non-empty pairwise_evidence[] and sequence_style_evidence." }),
+      checklistJson: Type.String({ description: "Copy the complete project-aware required_checklist from video_workflow status. Every check is JSON boolean true/false; exact_character_count is boolean (true when count matches), never numeric. Storyboard passes additionally require non-empty pairwise_evidence[] and sequence_style_evidence." }),
       reason: Type.String({ minLength: 1 }),
     }),
     async execute(_id, params, _signal, _update, ctx) {

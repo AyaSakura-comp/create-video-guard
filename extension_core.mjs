@@ -83,6 +83,34 @@ const CHECKLISTS = {
 
 const BASE_RECOVERY = "On any tool error, call video_workflow with action=status and follow its next action; do not grep or inspect implementation code";
 
+function hasVisibleSinging(status = {}) {
+  return (status.production_brief?.shot_manifest ?? []).some(
+    (shot) => shot.vocal_performance?.mode === "singing",
+  );
+}
+
+function reviewChecklist(stage, status = {}) {
+  const checklist = { ...CHECKLISTS[stage] };
+  if (status.project_type === "mv" && stage === "clips") {
+    checklist.audio_reference_timing_matches_manifest = true;
+    if (hasVisibleSinging(status)) {
+      Object.assign(checklist, {
+        visible_lyrics_match_manifest: true,
+        vocal_onsets_aligned: true,
+        bilabial_closures_present: true,
+        mouth_closed_during_rests: true,
+        mouth_unobstructed: true,
+        phrase_end_aligned: true,
+      });
+    }
+  }
+  if (status.project_type === "mv" && stage === "final") {
+    checklist.original_source_audio_remuxed = true;
+    checklist.source_audio_timeline_aligned = true;
+  }
+  return checklist;
+}
+
 export function compactWorkflowContext(status = {}) {
   return Object.fromEntries(Object.entries({
     state: status.state,
@@ -107,20 +135,46 @@ function clipGenerationGuidance(status, base) {
   const isMv = status.project_type === "mv";
   const shots = status.production_brief?.shot_manifest ?? [];
   const durations = shots.map((shot) => `${shot.id}=${shot.duration_seconds}s`).join(", ");
-  return {
-    ...base,
-    next_tool: "bash",
-    next_arguments: { purpose: "generate every planned variable-duration H3 segment in Shot Manifest order" },
-    command_template: isMv
-      ? "create_video.sh --mv --reference-image <approved-shot.png> --reference-audio <matching-source-segment.wav> --duration <planned-segment-duration> --prompt 'Use <Picture 1> ... Use <Audio 1> ...' --output <segment.mp4>"
-      : "First segment: text-to-video with create_video.sh --duration <planned-segment-duration> --prompt '<complete scene, camera, viewpoint, action, dialogue, ambience, SFX, music, and end state>'. Same-scene continuation: losslessly extract the previous clip actual last frame, then create_video.sh --image <previous-last-frame.png> --duration <planned-segment-duration> --prompt '<continue established motion and sound>' --output <segment.mp4>. Use an approved storyboard first frame only for a listed major scene change.",
-    do_before_call: [
+  const singingShot = shots.find((shot) => shot.vocal_performance?.mode === "singing");
+  const shotPromptRequirements = isMv ? shots.map((shot) => {
+    const vocal = shot.vocal_performance ?? { mode: "none" };
+    const requirement = {
+      id: shot.id,
+      vocal_mode: vocal.mode,
+      ...(vocal.subject_id !== undefined ? { subject_id: vocal.subject_id } : {}),
+      ...(vocal.speaker_id !== undefined ? { speaker_id: vocal.speaker_id } : {}),
+      ...(vocal.language !== undefined ? { language: vocal.language } : {}),
+      ...(vocal.lyrics !== undefined ? { exact_lyrics: vocal.lyrics } : {}),
+      required_reference_tags: ["<Picture 1>", "<Audio 1>"],
+    };
+    if (vocal.mode === "singing") {
+      requirement.required_lyric_block = `<d>[${vocal.language}] ${vocal.lyrics}</d>`;
+    }
+    return requirement;
+  }) : undefined;
+  const doBeforeCall = [
       `Use the manifest's variable durations rather than forcing five seconds${durations ? `: ${durations}` : ""}`,
       "For every segment describe the complete scene, camera movement, viewpoint and lens cues, subject action, exact dialogue, sound design (ambience, synchronized SFX, and music), temporal progression, and exact end state",
       "When one continuous action exceeds 5.2 seconds, continue in another manifest segment seeded by the previous clip's losslessly extracted actual last frame; remove the duplicated opening frame at assembly",
       "Do not generate an image storyboard for an unchanged scene; use one only for storyboard_shot_ids that mark major scene/geography changes",
       "Generate every segment, then extract first/middle/last and join-boundary QC contact sheets before submitting stage=clips",
-    ],
+  ];
+  if (isMv) {
+    doBeforeCall.push("Cut each source-audio excerpt at its manifest audio_start_seconds on a lyric phrase, breath, or instrumental rest; never cut through a syllable or sustained vowel");
+    doBeforeCall.push("Construct each exact UTF-8 full-reference prompt from that shot's shot_prompt_requirements, base64-encode it, and substitute only the base64 token into the command template; never interpolate raw lyrics or language into executable shell text");
+  }
+  if (singingShot) {
+    doBeforeCall.push("Keep one singer's mouth unobstructed in MCU/CU; align vocal onset, readable vowels, breaths, mouth closure during rests, M/B/P lip closure, sustained final vowel, and phrase end to <Audio 1>");
+  }
+  return {
+    ...base,
+    next_tool: "bash",
+    next_arguments: { purpose: "generate every planned variable-duration H3 segment in Shot Manifest order" },
+    command_template: isMv
+      ? "PROMPT_B64=BASE64_ENCODED_UTF8_PROMPT; create_video.sh --mv --reference-image <approved-shot.png> --reference-audio <matching-source-segment.wav> --duration <planned-segment-duration> --prompt \"$(printf %s \"$PROMPT_B64\" | base64 --decode)\" --output <segment.mp4>"
+      : "First segment: text-to-video with create_video.sh --duration <planned-segment-duration> --prompt '<complete scene, camera, viewpoint, action, dialogue, ambience, SFX, music, and end state>'. Same-scene continuation: losslessly extract the previous clip actual last frame, then create_video.sh --image <previous-last-frame.png> --duration <planned-segment-duration> --prompt '<continue established motion and sound>' --output <segment.mp4>. Use an approved storyboard first frame only for a listed major scene change.",
+    ...(isMv ? { shot_prompt_requirements: shotPromptRequirements } : {}),
+    do_before_call: doBeforeCall,
   };
 }
 
@@ -139,6 +193,8 @@ export function workflowGuidance(status = {}) {
         "Classify an existing-song music video as projectType=mv; otherwise use narrative or other",
         "Create an exact-duration Shot Manifest of variable-duration H3 segments; every segment must be at most 5.2 seconds, and actions longer than that continue in another segment using previous_last_frame",
         "For every segment persist scene_id, continuation, camera, action, dialogue, and sound so the H3 prompt fully describes movement, viewpoint, performance, speech, ambience, SFX, and music",
+        "For every MV segment persist vocal_performance.mode as none or singing; singing requires exact subject_id, stable speaker_id such as S1, source language, and exact un-translated lyrics for an H3 <d> block",
+        "For MV set audio_plan.source_audio_usage=reference_only and audio_plan.final_audio_policy=remux_original_source; generated H3 audio is never the authoritative song master",
         "Set continuity_bible.storyboard_policy: direct for one unchanged scene, selective for only major scene/geography changes, or full only when explicitly/technically required; list only required image shots in storyboard_shot_ids",
         "Separate explicit requirements, attributed assumptions, and creative choices",
         "Lock a style bible with one exact positive prompt prefix and negative prompt; describe line grammar, cel shading, palette, background rendering, contrast, and color temperature",
@@ -167,7 +223,7 @@ export function workflowGuidance(status = {}) {
       priority_instruction: `Ignore previously answered user messages. The current production state is ${state}; visually inspect the submitted artifacts and perform the ${stage} review now`,
       next_tool: "video_record_review",
       next_arguments: { stage, verdict: "pass-or-fail-after-visual-inspection" },
-      required_checklist: CHECKLISTS[stage],
+      required_checklist: reviewChecklist(stage, status),
       type_warning: "Every checklist value is JSON boolean true or false; exact_character_count is boolean true when the count matches the brief—never use number 1 or string '1'",
       do_before_call: [
         "Inspect every attached artifact at full resolution",
@@ -257,6 +313,15 @@ export function productionBriefPayload(params) {
       sound: shot.sound,
       ...(shot.audioStartSeconds !== undefined
         ? { audio_start_seconds: shot.audioStartSeconds }
+        : {}),
+      ...(shot.vocalPerformance !== undefined
+        ? { vocal_performance: {
+          mode: shot.vocalPerformance.mode,
+          ...(shot.vocalPerformance.subjectId !== undefined ? { subject_id: shot.vocalPerformance.subjectId } : {}),
+          ...(shot.vocalPerformance.speakerId !== undefined ? { speaker_id: shot.vocalPerformance.speakerId } : {}),
+          ...(shot.vocalPerformance.language !== undefined ? { language: shot.vocalPerformance.language } : {}),
+          ...(shot.vocalPerformance.lyrics !== undefined ? { lyrics: shot.vocalPerformance.lyrics } : {}),
+        } }
         : {}),
     })),
     continuity_bible: params.continuityBible,

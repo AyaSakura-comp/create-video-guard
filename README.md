@@ -13,11 +13,24 @@ Shot Manifest, continuity bible, and audio plan. This versioned treatment must r
 `treatment_approved` before a character sheet can be submitted.
 
 For `project_type=mv`, `video_define_brief` additionally requires an existing MP3/WAV source,
-hashes it, and requires each 2–5.2 second shot to declare its source-audio in-point. After
-storyboard approval, the shell gate rejects first-frame FL2VA and requires the local R2V route:
-`create_video.sh --mv --reference-image ... --reference-audio ...`. The vendored official ComfyUI
-template is `~/.pi/agent/skills/create-video/workflows/video_minimax_h3_r2v.json`; the executable
-API graph is implemented by `~/src/ComfyUI/scripts/minimax_h3_ref_generate.py`.
+hashes it, and requires each 2–5.2 second shot to declare its source-audio in-point and a
+`vocal_performance.mode` of `none` or `singing`. A singing shot must lock `subject_id`, stable
+`speaker_id`, source language, and exact untranslated lyrics for H3's `<d>` block. The MV audio
+plan must mark generated audio as `reference_only` and set
+`final_audio_policy=remux_original_source`.
+
+After storyboard approval, the shell gate rejects first-frame FL2VA and requires the local R2V
+route: `create_video.sh --mv --reference-image ... --reference-audio ...`. Singing guidance
+returns structured per-shot prompt requirements that assign `<Picture 1>` to identity/composition,
+`<Audio 1>` to vocal timing, and each visible singer to its own stable speaker such as `(S1)`.
+Raw lyric/language text is kept out of executable shell templates; exact UTF-8 prompts are passed
+through a base64 token. Clip review adds project-aware checks for audio-reference
+timing; singing shots additionally require exact visible lyrics, aligned vocal onset and phrase
+end, M/B/P closures, mouth closure during rests, and an unobstructed mouth. Final MV review cannot
+pass until the original source song is remuxed and aligned to the locked timeline. The vendored
+official ComfyUI template is
+`~/.pi/agent/skills/create-video/workflows/video_minimax_h3_r2v.json`; the executable API graph is
+implemented by `~/src/ComfyUI/scripts/minimax_h3_ref_generate.py`.
 
 Every brief persists `storyboard_policy`:
 
@@ -35,7 +48,7 @@ and visually reviewed before the next guarded operation.
 ## Deterministic small-model guidance
 
 Every successful workflow tool result includes `workflow_guidance`: exactly one `next_tool`, its
-required preparation, exact review checklist schema, recovery behavior, and a stop-after-call flag.
+required preparation, exact project-aware review checklist schema, recovery behavior, and a stop-after-call flag.
 `video_workflow status` returns the complete locked production brief for explicit resume/recovery.
 Normal mutation results return only compact workflow metadata; they deliberately do not repeat the
 full brief, preventing 64K-context saturation and stale-answer regressions in smaller local models.

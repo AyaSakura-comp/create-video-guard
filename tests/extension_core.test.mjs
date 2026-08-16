@@ -202,11 +202,101 @@ test("storyboard review guidance exposes written evidence requirements", () => {
 });
 
 test("MV clip guidance requires the official image plus audio R2V route", () => {
-  const guidance = workflowGuidance({ state: "storyboards_approved", project_type: "mv" });
+  const guidance = workflowGuidance({
+    state: "storyboards_approved",
+    project_type: "mv",
+    production_brief: {
+      shot_manifest: [{
+        id: "S01", duration_seconds: 3.75,
+        vocal_performance: {
+          mode: "singing", subject_id: "Subject 1", speaker_id: "S1",
+          language: "Japanese", lyrics: "ここにいるよ",
+        },
+      }],
+    },
+  });
   assert.equal(guidance.next_tool, "bash");
   assert.match(guidance.command_template, /--mv/);
   assert.match(guidance.command_template, /--reference-image/);
   assert.match(guidance.command_template, /--reference-audio/);
+  assert.match(guidance.command_template, /base64/i);
+  assert.deepEqual(guidance.shot_prompt_requirements, [{
+    id: "S01",
+    vocal_mode: "singing",
+    subject_id: "Subject 1",
+    speaker_id: "S1",
+    language: "Japanese",
+    exact_lyrics: "ここにいるよ",
+    required_reference_tags: ["<Picture 1>", "<Audio 1>"],
+    required_lyric_block: "<d>[Japanese] ここにいるよ</d>",
+  }]);
+  assert.match(guidance.do_before_call.join(" "), /mouth.*rests.*M\/B\/P/i);
+});
+
+test("MV guidance keeps mixed per-shot vocal metadata out of executable shell text", () => {
+  const unsafeLanguage = "English'; echo injected #";
+  const guidance = workflowGuidance({
+    state: "storyboards_approved",
+    project_type: "mv",
+    production_brief: {
+      shot_manifest: [
+        {
+          id: "S01", duration_seconds: 3,
+          vocal_performance: {
+            mode: "singing", subject_id: "Subject 1", speaker_id: "S1",
+            language: "Japanese", lyrics: "一番",
+          },
+        },
+        { id: "S02", duration_seconds: 3, vocal_performance: { mode: "none" } },
+        {
+          id: "S03", duration_seconds: 3,
+          vocal_performance: {
+            mode: "singing", subject_id: "Subject 2", speaker_id: "S2",
+            language: unsafeLanguage, lyrics: "second line",
+          },
+        },
+      ],
+    },
+  });
+  assert.doesNotMatch(guidance.command_template, /echo injected|Japanese|second line|\(S1\)/);
+  assert.match(guidance.command_template, /base64/i);
+  assert.match(guidance.do_before_call.join(" "), /base64.*never.*raw lyrics/i);
+  assert.deepEqual(guidance.shot_prompt_requirements.map((shot) => ({
+    id: shot.id,
+    mode: shot.vocal_mode,
+    speaker: shot.speaker_id,
+    lyrics: shot.exact_lyrics,
+  })), [
+    { id: "S01", mode: "singing", speaker: "S1", lyrics: "一番" },
+    { id: "S02", mode: "none", speaker: undefined, lyrics: undefined },
+    { id: "S03", mode: "singing", speaker: "S2", lyrics: "second line" },
+  ]);
+});
+
+test("MV singing clip review exposes hard lip-sync checks", () => {
+  const guidance = workflowGuidance({
+    state: "clips_pending_review",
+    project_type: "mv",
+    production_brief: {
+      shot_manifest: [{ vocal_performance: { mode: "singing" } }],
+    },
+  });
+  assert.equal(guidance.required_checklist.audio_reference_timing_matches_manifest, true);
+  assert.equal(guidance.required_checklist.visible_lyrics_match_manifest, true);
+  assert.equal(guidance.required_checklist.vocal_onsets_aligned, true);
+  assert.equal(guidance.required_checklist.bilabial_closures_present, true);
+  assert.equal(guidance.required_checklist.mouth_closed_during_rests, true);
+  assert.equal(guidance.required_checklist.mouth_unobstructed, true);
+  assert.equal(guidance.required_checklist.phrase_end_aligned, true);
+});
+
+test("MV final review requires authoritative original-song remux checks", () => {
+  const guidance = workflowGuidance({
+    state: "final_pending_review",
+    project_type: "mv",
+  });
+  assert.equal(guidance.required_checklist.original_source_audio_remuxed, true);
+  assert.equal(guidance.required_checklist.source_audio_timeline_aligned, true);
 });
 
 test("failed reviews tell the model to regenerate instead of searching implementation code", () => {
@@ -230,9 +320,16 @@ test("maps agent-expanded vague requirements to the persisted production brief",
       continuation: "storyboard", camera: "slow low-angle push-in",
       action: "dancer lands in final pose", dialogue: "none",
       sound: "rain ambience and applause", audioStartSeconds: 0,
+      vocalPerformance: {
+        mode: "singing", subjectId: "Subject 1", speakerId: "S1",
+        language: "Japanese", lyrics: "ここにいるよ",
+      },
     }],
     continuityBible: { direction: "left-to-right" },
-    audioPlan: { ambience: "rain" },
+    audioPlan: {
+      ambience: "rain", source_audio_usage: "reference_only",
+      final_audio_policy: "remux_original_source",
+    },
   });
   assert.equal(payload.user_request, "A dancer on a moonlit stage");
   assert.equal(payload.project_type, "mv");
@@ -244,6 +341,10 @@ test("maps agent-expanded vague requirements to the persisted production brief",
       continuation: "storyboard", camera: "slow low-angle push-in",
       action: "dancer lands in final pose", dialogue: "none",
       sound: "rain ambience and applause", audio_start_seconds: 0,
+      vocal_performance: {
+        mode: "singing", subject_id: "Subject 1", speaker_id: "S1",
+        language: "Japanese", lyrics: "ここにいるよ",
+      },
     },
   ]);
   assert.deepEqual(payload.agent_assumptions[0], {

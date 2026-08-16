@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -43,6 +44,30 @@ CHECKLISTS = {
     ),
     "final": ("joins_clean", "audiovisual_sync", "style_consistent", "exact_duration"),
 }
+MV_CLIP_CHECKS = ("audio_reference_timing_matches_manifest",)
+MV_SINGING_CLIP_CHECKS = (
+    "visible_lyrics_match_manifest", "vocal_onsets_aligned",
+    "bilabial_closures_present", "mouth_closed_during_rests",
+    "mouth_unobstructed", "phrase_end_aligned",
+)
+MV_FINAL_CHECKS = ("original_source_audio_remuxed", "source_audio_timeline_aligned")
+
+
+def required_checklist(brief, stage):
+    fields = list(CHECKLISTS[stage])
+    if isinstance(brief, dict) and brief.get("project_type") == "mv":
+        if stage == "clips":
+            fields.extend(MV_CLIP_CHECKS)
+            if any(
+                isinstance(shot, dict)
+                and isinstance(shot.get("vocal_performance"), dict)
+                and shot["vocal_performance"].get("mode") == "singing"
+                for shot in brief.get("shot_manifest", [])
+            ):
+                fields.extend(MV_SINGING_CLIP_CHECKS)
+        elif stage == "final":
+            fields.extend(MV_FINAL_CHECKS)
+    return tuple(fields)
 
 
 def now() -> str:
@@ -335,6 +360,34 @@ def validate_production_brief(brief):
                 "invalid_production_brief",
                 detail="MV shots require audio_start_seconds and local 2–5.2 second durations",
             )
+        audio_plan = brief.get("audio_plan")
+        if (
+            not isinstance(audio_plan, dict)
+            or audio_plan.get("source_audio_usage") != "reference_only"
+            or audio_plan.get("final_audio_policy") != "remux_original_source"
+        ):
+            fail(
+                "invalid_production_brief",
+                detail="MV audio_plan requires source_audio_usage=reference_only and final_audio_policy=remux_original_source",
+            )
+        for shot in shots:
+            vocal = shot.get("vocal_performance")
+            if not isinstance(vocal, dict) or vocal.get("mode") not in ("none", "singing"):
+                fail(
+                    "invalid_production_brief",
+                    detail="every MV shot requires vocal_performance.mode set to none or singing",
+                )
+            if vocal["mode"] == "singing":
+                required_vocal = ("subject_id", "speaker_id", "language", "lyrics")
+                if (
+                    any(not isinstance(vocal.get(key), str) or not vocal[key].strip() for key in required_vocal)
+                    or re.fullmatch(r"Subject [1-9][0-9]*", vocal["subject_id"]) is None
+                    or re.fullmatch(r"S[1-9][0-9]*", vocal["speaker_id"]) is None
+                ):
+                    fail(
+                        "invalid_production_brief",
+                        detail="singing vocal_performance requires subject_id like Subject 1, speaker_id like S1, source language, and exact un-translated lyrics",
+                    )
         brief["source_audio_path"] = str(audio_path)
         brief["source_audio_sha256"] = file_hash(audio_path)
 
@@ -443,12 +496,14 @@ def command_review(conn, session_id, stage, verdict, checklist_json, reason, rev
         fail("invalid_checklist", detail="checklist must be an object")
 
     if verdict == "pass":
-        missing = [field for field in CHECKLISTS[stage] if checklist.get(field) is not True]
+        brief = latest_production_brief(conn, session_id)
+        required_fields = required_checklist(brief, stage)
+        missing = [field for field in required_fields if checklist.get(field) is not True]
         if missing:
             fail(
                 "incomplete_checklist",
                 missing=missing,
-                expected_checklist={field: True for field in CHECKLISTS[stage]},
+                expected_checklist={field: True for field in required_fields},
                 type_warning="Every checklist value must be JSON boolean true; never use a number or string",
                 recovery="Visually inspect the submitted artifacts. Record fail if any check is false; otherwise retry once with the exact boolean schema",
             )

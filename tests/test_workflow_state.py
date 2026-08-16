@@ -74,6 +74,28 @@ def production_brief(user_request: str = "A dancer crosses a moonlit stage") -> 
     })
 
 
+def mv_brief(audio: Path, *, singing: bool = False) -> dict:
+    brief = json.loads(production_brief("Make a music video for this song"))
+    brief["project_type"] = "mv"
+    brief["source_audio_path"] = str(audio)
+    brief["audio_plan"].update({
+        "source_audio_usage": "reference_only",
+        "final_audio_policy": "remux_original_source",
+    })
+    for shot, start in zip(brief["shot_manifest"], (0, 4, 7)):
+        shot["audio_start_seconds"] = start
+        shot["vocal_performance"] = {"mode": "none"}
+    if singing:
+        brief["shot_manifest"][0]["vocal_performance"] = {
+            "mode": "singing",
+            "subject_id": "Subject 1",
+            "speaker_id": "S1",
+            "language": "Japanese",
+            "lyrics": "ここにいるよ",
+        }
+    return brief
+
+
 def define_brief(db: Path, session: str):
     return run_cli(db, session, "define-brief", "--brief-json", production_brief())
 
@@ -282,16 +304,126 @@ class WorkflowStateTests(unittest.TestCase):
         run_cli(self.db, "session-mv", "start")
         audio = self.tmp_path / "song.mp3"
         audio.write_bytes(b"source song")
-        brief = json.loads(production_brief("Make a music video for this song"))
-        brief["project_type"] = "mv"
-        brief["source_audio_path"] = str(audio)
-        for shot, start in zip(brief["shot_manifest"], (0, 4, 7)):
-            shot["audio_start_seconds"] = start
+        brief = mv_brief(audio)
         result = run_cli(
             self.db, "session-mv", "define-brief", "--brief-json", json.dumps(brief),
         )
         self.assertEqual(result["state"], "treatment_approved")
         self.assertEqual(len(result["source_audio_sha256"]), 64)
+
+    def test_mv_brief_rejects_missing_vocal_performance_mode(self):
+        run_cli(self.db, "session-mv-vocal-mode", "start")
+        audio = self.tmp_path / "song-mode.mp3"
+        audio.write_bytes(b"source song")
+        brief = mv_brief(audio)
+        del brief["shot_manifest"][0]["vocal_performance"]
+        error = run_cli(
+            self.db, "session-mv-vocal-mode", "define-brief",
+            "--brief-json", json.dumps(brief), ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_production_brief")
+        self.assertIn("vocal_performance", error["detail"])
+
+    def test_mv_singing_shot_requires_exact_speaker_language_and_lyrics(self):
+        run_cli(self.db, "session-mv-singing", "start")
+        audio = self.tmp_path / "song-singing.mp3"
+        audio.write_bytes(b"source song")
+        brief = mv_brief(audio, singing=True)
+        del brief["shot_manifest"][0]["vocal_performance"]["lyrics"]
+        error = run_cli(
+            self.db, "session-mv-singing", "define-brief",
+            "--brief-json", json.dumps(brief), ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_production_brief")
+        self.assertIn("subject_id", error["detail"])
+        self.assertIn("speaker_id", error["detail"])
+        self.assertIn("language", error["detail"])
+        self.assertIn("lyrics", error["detail"])
+
+    def test_mv_brief_requires_reference_only_then_original_audio_remux_policy(self):
+        run_cli(self.db, "session-mv-audio-policy", "start")
+        audio = self.tmp_path / "song-policy.mp3"
+        audio.write_bytes(b"source song")
+        brief = mv_brief(audio)
+        brief["audio_plan"]["final_audio_policy"] = "keep_generated_audio"
+        error = run_cli(
+            self.db, "session-mv-audio-policy", "define-brief",
+            "--brief-json", json.dumps(brief), ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_production_brief")
+        self.assertIn("remux_original_source", error["detail"])
+
+    def test_mv_singing_clip_pass_requires_lip_sync_checks(self):
+        session = "session-mv-lip-review"
+        run_cli(self.db, session, "start")
+        audio = self.tmp_path / "song-lip.mp3"
+        audio.write_bytes(b"source song")
+        run_cli(
+            self.db, session, "define-brief",
+            "--brief-json", json.dumps(mv_brief(audio, singing=True)),
+        )
+        character = self.make_artifact("mv-character.png")
+        storyboard = self.make_artifact("mv-storyboard.png")
+        clips = self.make_artifact("mv-clips.png")
+        run_cli(self.db, session, "submit", "--stage", "character_sheet", "--artifact", str(character))
+        run_cli(
+            self.db, session, "review", "--stage", "character_sheet", "--verdict", "pass",
+            "--checklist-json", pass_checklist("character_sheet"), "--reason", "valid",
+        )
+        run_cli(self.db, session, "submit", "--stage", "storyboards", "--artifact", str(storyboard))
+        run_cli(
+            self.db, session, "review", "--stage", "storyboards", "--verdict", "pass",
+            "--checklist-json", pass_checklist("storyboards"), "--reason", "valid",
+        )
+        run_cli(self.db, session, "submit", "--stage", "clips", "--artifact", str(clips))
+        error = run_cli(
+            self.db, session, "review", "--stage", "clips", "--verdict", "pass",
+            "--checklist-json", pass_checklist("clips"), "--reason", "lip sync omitted", ok=False,
+        )
+        self.assertEqual(error["error"], "incomplete_checklist")
+        self.assertIn("audio_reference_timing_matches_manifest", error["missing"])
+        self.assertIn("visible_lyrics_match_manifest", error["missing"])
+        self.assertIn("bilabial_closures_present", error["missing"])
+        self.assertIn("mouth_closed_during_rests", error["missing"])
+
+    def test_mv_final_pass_requires_authoritative_original_audio_checks(self):
+        session = "session-mv-final-audio"
+        run_cli(self.db, session, "start")
+        audio = self.tmp_path / "song-final.mp3"
+        audio.write_bytes(b"source song")
+        run_cli(
+            self.db, session, "define-brief",
+            "--brief-json", json.dumps(mv_brief(audio)),
+        )
+        character = self.make_artifact("mv-final-character.png")
+        storyboard = self.make_artifact("mv-final-storyboard.png")
+        clips = self.make_artifact("mv-final-clips.png")
+        final = self.make_artifact("mv-final-qc.png")
+        run_cli(self.db, session, "submit", "--stage", "character_sheet", "--artifact", str(character))
+        run_cli(
+            self.db, session, "review", "--stage", "character_sheet", "--verdict", "pass",
+            "--checklist-json", pass_checklist("character_sheet"), "--reason", "valid",
+        )
+        run_cli(self.db, session, "submit", "--stage", "storyboards", "--artifact", str(storyboard))
+        run_cli(
+            self.db, session, "review", "--stage", "storyboards", "--verdict", "pass",
+            "--checklist-json", pass_checklist("storyboards"), "--reason", "valid",
+        )
+        run_cli(self.db, session, "submit", "--stage", "clips", "--artifact", str(clips))
+        clip_checks = json.loads(pass_checklist("clips"))
+        clip_checks["audio_reference_timing_matches_manifest"] = True
+        run_cli(
+            self.db, session, "review", "--stage", "clips", "--verdict", "pass",
+            "--checklist-json", json.dumps(clip_checks), "--reason", "valid",
+        )
+        run_cli(self.db, session, "submit", "--stage", "final", "--artifact", str(final))
+        error = run_cli(
+            self.db, session, "review", "--stage", "final", "--verdict", "pass",
+            "--checklist-json", pass_checklist("final"), "--reason", "remux not checked", ok=False,
+        )
+        self.assertEqual(error["error"], "incomplete_checklist")
+        self.assertIn("original_source_audio_remuxed", error["missing"])
+        self.assertIn("source_audio_timeline_aligned", error["missing"])
 
     def test_mv_brief_rejects_missing_source_audio(self):
         run_cli(self.db, "session-mv", "start")
