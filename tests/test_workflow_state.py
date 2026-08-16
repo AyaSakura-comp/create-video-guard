@@ -96,6 +96,94 @@ def mv_brief(audio: Path, *, singing: bool = False) -> dict:
     return brief
 
 
+def cut_plan() -> dict:
+    return {
+        "cuts": [
+            {
+                "id": "C01",
+                "duration_seconds": 6,
+                "scene_id": "stage",
+                "start_frame": {
+                    "scene": "moonlit stage with rain beyond the windows",
+                    "characters": "adult dancer centered, full costume visible",
+                    "objects": "wood floor, curtain, three footlights",
+                    "character_pose": "feet planted, hands relaxed at sides",
+                    "character_expression": "focused and uncertain",
+                    "composition": "medium-wide centered composition",
+                    "camera": "eye-level 35mm viewpoint",
+                    "lighting": "cool moonlight from screen left",
+                },
+                "action": {
+                    "camera_movement": "slow push in by one metre",
+                    "scene_changes": "rain strengthens behind the windows",
+                    "character_actions": "dancer raises both arms and begins one turn",
+                    "facial_changes": "uncertainty becomes concentration",
+                    "body_motion": "weight shifts left, arms rise, torso rotates",
+                    "temporal_progression": "prepare, raise, rotate, then settle",
+                    "end_state": "dancer faces screen right with arms extended",
+                    "sound": "auditorium ambience, rain, cloth movement",
+                },
+                "generation_segments": [
+                    {
+                        "id": "C01-G01", "start_offset_seconds": 0,
+                        "duration_seconds": 3, "continuation": "storyboard",
+                        "action_slice": "prepare and raise both arms",
+                        "end_state": "arms raised before turn",
+                    },
+                    {
+                        "id": "C01-G02", "start_offset_seconds": 3,
+                        "duration_seconds": 3, "continuation": "previous_last_frame",
+                        "action_slice": "complete one turn and settle",
+                        "end_state": "faces screen right with arms extended",
+                    },
+                ],
+            },
+            {
+                "id": "C02",
+                "duration_seconds": 4,
+                "scene_id": "stage",
+                "start_frame": {
+                    "scene": "same moonlit stage after the turn",
+                    "characters": "same adult dancer facing screen right",
+                    "objects": "wood floor, curtain, three footlights",
+                    "character_pose": "arms extended, right foot forward",
+                    "character_expression": "determined",
+                    "composition": "medium close-up with nose room right",
+                    "camera": "eye-level 65mm viewpoint",
+                    "lighting": "same cool moonlight from screen left",
+                },
+                "action": {
+                    "camera_movement": "gentle static hold then small push",
+                    "scene_changes": "footlights brighten slightly",
+                    "character_actions": "dancer lowers arms into final bow",
+                    "facial_changes": "determination softens into relief",
+                    "body_motion": "arms lower, torso bows, knees soften",
+                    "temporal_progression": "hold, lower arms, bow, settle",
+                    "end_state": "final bowed pose",
+                    "sound": "rain ambience and applause rises",
+                },
+                "generation_segments": [
+                    {
+                        "id": "C02-G01", "start_offset_seconds": 0,
+                        "duration_seconds": 4, "continuation": "storyboard",
+                        "action_slice": "lower arms and complete final bow",
+                        "end_state": "final bowed pose",
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def mv_cut_plan() -> dict:
+    plan = cut_plan()
+    starts = iter((0, 3, 6))
+    for cut in plan["cuts"]:
+        for segment in cut["generation_segments"]:
+            segment["audio_start_seconds"] = next(starts)
+    return plan
+
+
 def define_brief(db: Path, session: str):
     return run_cli(db, session, "define-brief", "--brief-json", production_brief())
 
@@ -107,6 +195,11 @@ def pass_checklist(stage: str) -> str:
             "pure_white_background", "no_duplicates_or_extras",
             "single_view_per_character", "no_insets_labels_or_swatches",
             "anatomy_uncropped",
+        ],
+        "cut_plan": [
+            "cut_count_justified", "durations_match_action_density",
+            "duration_bounds_valid", "start_frames_complete", "actions_complete",
+            "segment_coverage_complete", "continuity_coherent", "total_duration_exact",
         ],
         "storyboards": [
             "all_planned_shots_present", "identity_consistent",
@@ -142,15 +235,287 @@ class WorkflowStateTests(unittest.TestCase):
 
     def make_artifact(self, name: str = "frame.png") -> Path:
         artifact = self.tmp_path / name
-        artifact.write_bytes(b"visual evidence")
+        artifact.write_bytes(f"visual evidence:{name}".encode())
         return artifact
+
+    def approve_character(self, session: str):
+        character = self.make_artifact(f"{session}-character.png")
+        run_cli(self.db, session, "submit", "--stage", "character_sheet", "--artifact", str(character))
+        run_cli(
+            self.db, session, "review", "--stage", "character_sheet", "--verdict", "pass",
+            "--checklist-json", pass_checklist("character_sheet"), "--reason", "valid",
+        )
+
+    def approve_cut_plan(self, session: str, plan: dict | None = None):
+        run_cli(
+            self.db, session, "define-cut-plan",
+            "--cut-plan-json", json.dumps(plan or cut_plan()),
+        )
+        run_cli(
+            self.db, session, "review", "--stage", "cut_plan", "--verdict", "pass",
+            "--checklist-json", pass_checklist("cut_plan"), "--reason", "complete",
+        )
 
     def test_start_creates_brief_workflow(self):
         result = run_cli(self.db, "session-a", "start")
         self.assertEqual(result["session_id"], "session-a")
         self.assertEqual(result["state"], "brief")
 
-    def test_same_scene_direct_plan_allows_clip_submission_after_character_approval(self):
+    def test_cut_plan_is_persisted_between_character_and_storyboard_stages(self):
+        session = "session-cut-plan"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        result = run_cli(
+            self.db, session, "define-cut-plan", "--cut-plan-json", json.dumps(cut_plan()),
+        )
+        self.assertEqual(result["state"], "cut_plan_pending_review")
+        self.assertEqual(result["version"], 1)
+        self.assertEqual(result["cut_count"], 2)
+        self.assertEqual(len(result["sha256"]), 64)
+        status = run_cli(self.db, session, "status")
+        self.assertEqual(status["cut_plan_version"], 1)
+        self.assertEqual(status["cut_count"], 2)
+        self.assertEqual(status["cut_plan"]["cuts"][0]["start_frame"]["objects"], "wood floor, curtain, three footlights")
+        self.assertEqual(status["cut_plan"]["cuts"][0]["action"]["body_motion"], "weight shifts left, arms rise, torso rotates")
+        self.assertEqual(status["cut_plan"]["cuts"][0]["generation_segments"][1]["continuation"], "previous_last_frame")
+
+    def test_status_queries_normalized_cut_start_frames_and_actions(self):
+        session = "session-cut-query"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        run_cli(self.db, session, "define-cut-plan", "--cut-plan-json", json.dumps(cut_plan()))
+        import sqlite3
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE cut_plans SET plan_json = ? WHERE session_id = ?",
+                (json.dumps({"cuts": []}), session),
+            )
+        status = run_cli(self.db, session, "status")
+        self.assertEqual(len(status["cut_plan"]["cuts"]), 2)
+        self.assertEqual(status["cut_plan"]["cuts"][0]["start_frame"]["scene"], "moonlit stage with rain beyond the windows")
+        self.assertEqual(status["cut_plan"]["cuts"][1]["action"]["camera_movement"], "gentle static hold then small push")
+
+    def test_normalized_status_preserves_exact_decimal_timing_text(self):
+        session = "session-exact-status"
+        run_cli(self.db, session, "start")
+        raw_brief = production_brief()
+        raw_brief = raw_brief.replace(
+            '"target_duration_seconds": 10,',
+            '"target_duration_seconds": 10.0000000000000000001,',
+            1,
+        ).replace(
+            '"duration_seconds": 3,',
+            '"duration_seconds": 3.0000000000000000001,',
+            1,
+        )
+        run_cli(self.db, session, "define-brief", "--brief-json", raw_brief)
+        self.approve_character(session)
+        raw_plan = json.dumps(cut_plan()).replace(
+            '"duration_seconds": 4,',
+            '"duration_seconds": 4.0000000000000000001,',
+            2,
+        )
+        run_cli(self.db, session, "define-cut-plan", "--cut-plan-json", raw_plan)
+        status = run_cli(self.db, session, "status")
+        self.assertEqual(status["target_duration_seconds_exact"], "10.0000000000000000001")
+        self.assertEqual(
+            status["production_brief"]["shot_manifest"][1]["duration_seconds_exact"],
+            "3.0000000000000000001",
+        )
+        self.assertEqual(status["cut_plan_total_duration_seconds_exact"], "10.0000000000000000001")
+        self.assertEqual(status["cut_plan"]["cuts"][1]["duration_seconds_exact"], "4.0000000000000000001")
+        self.assertEqual(
+            status["cut_plan"]["cuts"][1]["generation_segments"][0]["duration_seconds_exact"],
+            "4.0000000000000000001",
+        )
+
+    def test_cut_plan_uses_exact_decimal_values_for_duration_bounds(self):
+        session = "session-cut-exact-bounds"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        raw_plan = json.dumps(cut_plan()).replace(
+            '"duration_seconds": 6,',
+            '"duration_seconds": 15.0000000000000000001,',
+            1,
+        )
+        error = run_cli(
+            self.db, session, "define-cut-plan", "--cut-plan-json", raw_plan, ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_cut_plan")
+        self.assertIn("1–15", error["detail"])
+
+    def test_cut_plan_rejects_cut_outside_one_to_fifteen_seconds(self):
+        session = "session-cut-duration"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        plan = cut_plan()
+        plan["cuts"][0]["duration_seconds"] = 16
+        error = run_cli(
+            self.db, session, "define-cut-plan", "--cut-plan-json", json.dumps(plan), ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_cut_plan")
+        self.assertIn("1–15", error["detail"])
+
+    def test_cut_plan_rejects_incomplete_start_frame_action_or_segment_coverage(self):
+        session = "session-cut-fields"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        plan = cut_plan()
+        del plan["cuts"][0]["start_frame"]["objects"]
+        error = run_cli(
+            self.db, session, "define-cut-plan", "--cut-plan-json", json.dumps(plan), ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_cut_plan")
+        self.assertIn("start_frame", error["detail"])
+
+        plan = cut_plan()
+        plan["cuts"][0]["generation_segments"][1]["start_offset_seconds"] = 4
+        error = run_cli(
+            self.db, session, "define-cut-plan", "--cut-plan-json", json.dumps(plan), ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_cut_plan")
+        self.assertIn("contiguous", error["detail"])
+
+    def test_cut_plan_requires_exact_offsets_and_target_duration(self):
+        session = "session-cut-exact"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        plan = cut_plan()
+        plan["cuts"][0]["generation_segments"][1]["start_offset_seconds"] = 3.0000001
+        error = run_cli(
+            self.db, session, "define-cut-plan", "--cut-plan-json", json.dumps(plan), ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_cut_plan")
+        self.assertIn("contiguous", error["detail"])
+
+        plan = cut_plan()
+        plan["cuts"][1]["duration_seconds"] = 4.001
+        plan["cuts"][1]["generation_segments"][0]["duration_seconds"] = 4.001
+        error = run_cli(
+            self.db, session, "define-cut-plan", "--cut-plan-json", json.dumps(plan), ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_cut_plan")
+        self.assertIn("target_duration_seconds", error["detail"])
+
+    def test_cut_plan_preserves_decimal_precision_during_exact_timing_validation(self):
+        session = "session-cut-decimal-precision"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        raw_plan = json.dumps(cut_plan())
+        raw_plan = raw_plan.replace(
+            '"start_offset_seconds": 3,',
+            '"start_offset_seconds": 3.0000000000000000001,',
+            1,
+        )
+        error = run_cli(
+            self.db, session, "define-cut-plan", "--cut-plan-json", raw_plan, ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_cut_plan")
+        self.assertIn("contiguous", error["detail"])
+
+    def test_cut_plan_rejects_non_finite_timing_values(self):
+        session = "session-cut-nonfinite"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        plan = cut_plan()
+        plan["cuts"][0]["duration_seconds"] = float("nan")
+        error = run_cli(
+            self.db, session, "define-cut-plan", "--cut-plan-json", json.dumps(plan), ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_cut_plan")
+        self.assertIn("finite", error["detail"])
+
+    def test_cut_plan_review_is_required_before_storyboard_submission(self):
+        session = "session-cut-review"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        run_cli(self.db, session, "define-cut-plan", "--cut-plan-json", json.dumps(cut_plan()))
+        storyboard = self.make_artifact("cut-review-storyboard.png")
+        locked = run_cli(
+            self.db, session, "submit", "--stage", "storyboards",
+            "--artifact", str(storyboard), ok=False,
+        )
+        self.assertEqual(locked["error"], "stage_locked")
+        self.assertEqual(locked["required_state"], "cut_plan_approved")
+        reviewed = run_cli(
+            self.db, session, "review", "--stage", "cut_plan", "--verdict", "pass",
+            "--checklist-json", pass_checklist("cut_plan"), "--reason", "complete",
+        )
+        self.assertEqual(reviewed["state"], "cut_plan_approved")
+        storyboard_two = self.make_artifact("cut-review-storyboard-C02.png")
+        submitted = run_cli(
+            self.db, session, "submit", "--stage", "storyboards",
+            "--artifact", str(storyboard), "--artifact", str(storyboard_two),
+        )
+        self.assertEqual(submitted["state"], "storyboards_pending_review")
+
+    def test_storyboard_submission_requires_one_artifact_per_cut_and_persists_cut_ids(self):
+        session = "session-storyboard-coverage"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        self.approve_cut_plan(session)
+        first = self.make_artifact("C01.png")
+        error = run_cli(
+            self.db, session, "submit", "--stage", "storyboards",
+            "--artifact", str(first), ok=False,
+        )
+        self.assertEqual(error["error"], "incomplete_storyboard_coverage")
+        self.assertEqual(error["expected_cut_ids"], ["C01", "C02"])
+
+        duplicate = run_cli(
+            self.db, session, "submit", "--stage", "storyboards",
+            "--artifact", str(first), "--artifact", str(first), ok=False,
+        )
+        self.assertEqual(duplicate["error"], "duplicate_storyboard_artifact")
+
+        copied = self.tmp_path / "C02-copy.png"
+        copied.write_bytes(first.read_bytes())
+        duplicate_content = run_cli(
+            self.db, session, "submit", "--stage", "storyboards",
+            "--artifact", str(first), "--artifact", str(copied), ok=False,
+        )
+        self.assertEqual(duplicate_content["error"], "duplicate_storyboard_content")
+
+        second = self.make_artifact("C02.png")
+        result = run_cli(
+            self.db, session, "submit", "--stage", "storyboards",
+            "--artifact", str(first), "--artifact", str(second),
+        )
+        self.assertEqual(
+            [(item["cut_id"], Path(item["path"]).name) for item in result["artifacts"]],
+            [("C01", "C01.png"), ("C02", "C02.png")],
+        )
+        import sqlite3
+        with sqlite3.connect(self.db) as conn:
+            keys = [row[0] for row in conn.execute(
+                "SELECT artifact_key FROM stage_artifacts WHERE session_id = ? AND stage = 'storyboards' ORDER BY id",
+                (session,),
+            )]
+        self.assertEqual(keys, ["C01", "C02"])
+
+    def test_locked_brief_cannot_be_redefined_after_dependent_stages_exist(self):
+        session = "session-locked-brief"
+        run_cli(self.db, session, "start")
+        define_brief(self.db, session)
+        self.approve_character(session)
+        self.approve_cut_plan(session)
+        error = run_cli(
+            self.db, session, "define-brief", "--brief-json", production_brief("replacement"), ok=False,
+        )
+        self.assertEqual(error["error"], "stage_locked")
+        self.assertEqual(error["current_state"], "cut_plan_approved")
+
+    def test_same_scene_direct_plan_cannot_bypass_cut_plan_and_storyboards(self):
         run_cli(self.db, "session-direct", "start")
         brief = json.loads(production_brief())
         brief["continuity_bible"]["storyboard_policy"] = {
@@ -175,40 +540,12 @@ class WorkflowStateTests(unittest.TestCase):
             "--reason", "valid", "--reviewer", "test",
         )
         clip_qc = self.make_artifact("direct-clips-qc.png")
-        submitted = run_cli(
-            self.db, "session-direct", "submit", "--stage", "clips",
-            "--artifact", str(clip_qc),
-        )
-        self.assertEqual(submitted["state"], "clips_pending_review")
-
-    def test_same_scene_direct_plan_blocks_unnecessary_storyboard_submission(self):
-        run_cli(self.db, "session-no-storyboards", "start")
-        brief = json.loads(production_brief())
-        brief["continuity_bible"]["storyboard_policy"] = {
-            "mode": "direct", "reason": "one unchanged scene", "storyboard_shot_ids": [],
-        }
-        for index, shot in enumerate(brief["shot_manifest"]):
-            shot["continuation"] = "none" if index == 0 else "previous_last_frame"
-        run_cli(
-            self.db, "session-no-storyboards", "define-brief",
-            "--brief-json", json.dumps(brief),
-        )
-        character = self.make_artifact("no-storyboards-character.png")
-        run_cli(
-            self.db, "session-no-storyboards", "submit", "--stage", "character_sheet",
-            "--artifact", str(character),
-        )
-        run_cli(
-            self.db, "session-no-storyboards", "review", "--stage", "character_sheet",
-            "--verdict", "pass", "--checklist-json", pass_checklist("character_sheet"),
-            "--reason", "valid", "--reviewer", "test",
-        )
-        storyboard = self.make_artifact("unnecessary-storyboard.png")
         error = run_cli(
-            self.db, "session-no-storyboards", "submit", "--stage", "storyboards",
-            "--artifact", str(storyboard), ok=False,
+            self.db, "session-direct", "submit", "--stage", "clips",
+            "--artifact", str(clip_qc), ok=False,
         )
-        self.assertEqual(error["error"], "storyboards_not_required")
+        self.assertEqual(error["error"], "stage_locked")
+        self.assertEqual(error["required_state"], "storyboards_approved")
 
     def test_same_scene_direct_plan_rejects_storyboard_ids(self):
         run_cli(self.db, "session-invalid-direct", "start")
@@ -290,6 +627,31 @@ class WorkflowStateTests(unittest.TestCase):
         self.assertEqual(error["error"], "invalid_production_brief")
         self.assertIn("agent_assumptions", error["detail"])
 
+    def test_production_brief_preserves_decimal_precision_for_target_timing(self):
+        session = "session-brief-decimal-precision"
+        run_cli(self.db, session, "start")
+        raw_brief = production_brief().replace(
+            '"target_duration_seconds": 10,',
+            '"target_duration_seconds": 10.0000000000000000001,',
+            1,
+        )
+        error = run_cli(
+            self.db, session, "define-brief", "--brief-json", raw_brief, ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_production_brief")
+        self.assertIn("durations", error["detail"])
+
+    def test_production_brief_rejects_non_finite_timing(self):
+        run_cli(self.db, "session-nonfinite-brief", "start")
+        brief = json.loads(production_brief())
+        brief["target_duration_seconds"] = float("nan")
+        error = run_cli(
+            self.db, "session-nonfinite-brief", "define-brief",
+            "--brief-json", json.dumps(brief), ok=False,
+        )
+        self.assertEqual(error["error"], "invalid_production_brief")
+        self.assertIn("finite", error["detail"])
+
     def test_production_brief_rejects_shot_timing_that_does_not_match_target(self):
         run_cli(self.db, "session-a", "start")
         brief = json.loads(production_brief())
@@ -363,14 +725,19 @@ class WorkflowStateTests(unittest.TestCase):
             "--brief-json", json.dumps(mv_brief(audio, singing=True)),
         )
         character = self.make_artifact("mv-character.png")
-        storyboard = self.make_artifact("mv-storyboard.png")
+        storyboard = self.make_artifact("mv-storyboard-C01.png")
+        storyboard_two = self.make_artifact("mv-storyboard-C02.png")
         clips = self.make_artifact("mv-clips.png")
         run_cli(self.db, session, "submit", "--stage", "character_sheet", "--artifact", str(character))
         run_cli(
             self.db, session, "review", "--stage", "character_sheet", "--verdict", "pass",
             "--checklist-json", pass_checklist("character_sheet"), "--reason", "valid",
         )
-        run_cli(self.db, session, "submit", "--stage", "storyboards", "--artifact", str(storyboard))
+        self.approve_cut_plan(session, mv_cut_plan())
+        run_cli(
+            self.db, session, "submit", "--stage", "storyboards",
+            "--artifact", str(storyboard), "--artifact", str(storyboard_two),
+        )
         run_cli(
             self.db, session, "review", "--stage", "storyboards", "--verdict", "pass",
             "--checklist-json", pass_checklist("storyboards"), "--reason", "valid",
@@ -396,7 +763,8 @@ class WorkflowStateTests(unittest.TestCase):
             "--brief-json", json.dumps(mv_brief(audio)),
         )
         character = self.make_artifact("mv-final-character.png")
-        storyboard = self.make_artifact("mv-final-storyboard.png")
+        storyboard = self.make_artifact("mv-final-storyboard-C01.png")
+        storyboard_two = self.make_artifact("mv-final-storyboard-C02.png")
         clips = self.make_artifact("mv-final-clips.png")
         final = self.make_artifact("mv-final-qc.png")
         run_cli(self.db, session, "submit", "--stage", "character_sheet", "--artifact", str(character))
@@ -404,7 +772,11 @@ class WorkflowStateTests(unittest.TestCase):
             self.db, session, "review", "--stage", "character_sheet", "--verdict", "pass",
             "--checklist-json", pass_checklist("character_sheet"), "--reason", "valid",
         )
-        run_cli(self.db, session, "submit", "--stage", "storyboards", "--artifact", str(storyboard))
+        self.approve_cut_plan(session, mv_cut_plan())
+        run_cli(
+            self.db, session, "submit", "--stage", "storyboards",
+            "--artifact", str(storyboard), "--artifact", str(storyboard_two),
+        )
         run_cli(
             self.db, session, "review", "--stage", "storyboards", "--verdict", "pass",
             "--checklist-json", pass_checklist("storyboards"), "--reason", "valid",
@@ -444,7 +816,7 @@ class WorkflowStateTests(unittest.TestCase):
             "--artifact", str(artifact), ok=False,
         )
         self.assertEqual(error["error"], "stage_locked")
-        self.assertEqual(error["required_state"], "character_sheet_approved")
+        self.assertEqual(error["required_state"], "cut_plan_approved")
 
     def test_passing_complete_review_unlocks_next_stage_and_hashes_artifact(self):
         artifact = self.make_artifact()
@@ -467,7 +839,8 @@ class WorkflowStateTests(unittest.TestCase):
 
     def test_storyboard_pass_requires_sequence_level_style_checks(self):
         character = self.make_artifact("character.png")
-        storyboard = self.make_artifact("storyboard-contact.png")
+        storyboard = self.make_artifact("storyboard-contact-C01.png")
+        storyboard_two = self.make_artifact("storyboard-contact-C02.png")
         run_cli(self.db, "session-a", "start")
         define_brief(self.db, "session-a")
         run_cli(
@@ -479,9 +852,10 @@ class WorkflowStateTests(unittest.TestCase):
             "--verdict", "pass", "--checklist-json", pass_checklist("character_sheet"),
             "--reason", "Character sheet passes",
         )
+        self.approve_cut_plan("session-a")
         run_cli(
             self.db, "session-a", "submit", "--stage", "storyboards",
-            "--artifact", str(storyboard),
+            "--artifact", str(storyboard), "--artifact", str(storyboard_two),
         )
         checklist = json.loads(pass_checklist("storyboards"))
         del checklist["adjacent_cuts_compatible"]
@@ -495,7 +869,8 @@ class WorkflowStateTests(unittest.TestCase):
 
     def test_storyboard_pass_requires_written_pairwise_and_global_evidence(self):
         character = self.make_artifact("character-evidence.png")
-        storyboard = self.make_artifact("storyboard-evidence.png")
+        storyboard = self.make_artifact("storyboard-evidence-C01.png")
+        storyboard_two = self.make_artifact("storyboard-evidence-C02.png")
         run_cli(self.db, "session-evidence", "start")
         define_brief(self.db, "session-evidence")
         run_cli(
@@ -507,9 +882,10 @@ class WorkflowStateTests(unittest.TestCase):
             "--verdict", "pass", "--checklist-json", pass_checklist("character_sheet"),
             "--reason", "Character sheet passes",
         )
+        self.approve_cut_plan("session-evidence")
         run_cli(
             self.db, "session-evidence", "submit", "--stage", "storyboards",
-            "--artifact", str(storyboard),
+            "--artifact", str(storyboard), "--artifact", str(storyboard_two),
         )
         checklist = json.loads(pass_checklist("storyboards"))
         del checklist["pairwise_evidence"]

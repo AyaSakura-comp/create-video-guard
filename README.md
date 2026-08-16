@@ -5,12 +5,13 @@ Pi extension that enforces a SQLite-backed visual-review state machine for the
 
 ## Stages
 
-`vague brief → treatment → character_sheet → (direct clips | selective storyboards) → clips → final`
+`vague brief → treatment → character_sheet → cut_plan → storyboards → clips → final`
 
 The user's original wording is preserved while the agent fills in the production details:
 explicit requirements, attributed assumptions, creative choices, treatment, exact-duration
 Shot Manifest, continuity bible, and audio plan. This versioned treatment must reach
-`treatment_approved` before a character sheet can be submitted.
+`treatment_approved` before a character sheet can be submitted. Once the workflow leaves `brief`,
+the treatment cannot be redefined underneath dependent cut plans, artifacts, or reviews.
 
 For `project_type=mv`, `video_define_brief` additionally requires an existing MP3/WAV source,
 hashes it, and requires each 2–5.2 second shot to declare its source-audio in-point and a
@@ -32,18 +33,32 @@ official ComfyUI template is
 `~/.pi/agent/skills/create-video/workflows/video_minimax_h3_r2v.json`; the executable API graph is
 implemented by `~/src/ComfyUI/scripts/minimax_h3_ref_generate.py`.
 
-Every brief persists `storyboard_policy`:
+After character-sheet approval, `video_define_cut_plan` creates the authoritative editorial plan
+before any storyboard can be generated. An editorial cut lasts **1–15 seconds** and is chosen from
+story function, action density, camera changes, dialogue/lyric phrases, and scene changes. Every cut
+is persisted twice: as versioned canonical JSON with SHA256 and as normalized `cut_plan_items` rows
+whose independent columns contain duration (including canonical exact-decimal text), scene id,
+`start_frame_json`, `action_json`, and `generation_segments_json`. Production and cut timing is
+parsed with `Decimal`, persisted canonically, and exposed with `*_exact` status fields.
 
-- `direct`: one unchanged scene; skip image storyboards after character approval.
-- `selective`: generate images only for listed major scene/geography changes.
-- `full`: all segments need images, reserved for explicit/technical requirements such as MV R2V.
+Each cut's `start_frame` must completely describe the scene, every character, objects, pose,
+expression, composition, initial camera, and lighting. Its `action` must describe camera movement,
+scene changes, ordered character and facial actions, complete body motion, temporal progression,
+exact end state, and sound. The cut plan receives its own structured boolean review before it can
+unlock storyboards.
 
-Shot Manifest entries are variable-duration H3 segments up to 5.2 seconds and include `scene_id`,
-`continuation`, complete camera/viewpoint, action, dialogue, and sound plans. Longer same-scene
-actions are split and use the previous clip's actual lossless PNG last frame as the next first
-frame. Direct mode permits H3 and clip submission immediately after character-sheet approval and
-blocks unnecessary storyboard submission. Every stage that is actually required is still submitted
-and visually reviewed before the next guarded operation.
+Editorial cuts are distinct from local H3 generation segments. A cut may last up to 15 seconds,
+but each nested local segment remains at most 5.2 seconds. Segment zero starts from the cut's
+storyboard; later segments remain inside the same editorial cut and use the previous generated
+segment's actual last frame. Segment offsets must be contiguous and durations must sum exactly to
+the parent cut; cut durations must sum exactly to the production target.
+
+After cut-plan approval, storyboard guidance queries each cut's stored `start_frame` and requests
+one first-frame image per editorial cut in cut-plan order. Submission requires exactly one image
+for every cut and persists each storyboard's `artifact_key=cut_id`; missing, extra, repeated-path,
+or duplicate-SHA images cannot reach review. After storyboard approval, video guidance queries the
+stored `action` plus its ordered generation-segment slices. Shell gates reject storyboard creation
+before `cut_plan_approved` and reject H3 generation before `storyboards_approved`.
 
 ## Deterministic small-model guidance
 
@@ -69,8 +84,9 @@ full storyboard; shot-specific wording is appended after the locked prefix.
 
 - `video_workflow`: start/status
 - `video_define_brief`: expand and lock a vague request as a versioned production treatment
+- `video_define_cut_plan`: persist and lock 1–15 second editorial cuts, start frames, actions, and local generation segments
 - `video_submit_artifacts`: hash and attach visual artifacts for inspection
-- `video_record_review`: persist checklist-based pass/fail evidence
+- `video_record_review`: persist structured cut-plan or visual artifact checklist pass/fail evidence
 - `/video-workflow`: show current state
 
 State defaults to `~/.pi/agent/state/create-video-guard.sqlite3`, keyed by the

@@ -9,6 +9,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import {
   compactWorkflowContext,
+  cutPlanPayload,
   gateCommand,
   productionBriefPayload,
   workflowGuidance,
@@ -18,7 +19,8 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const STATE_SCRIPT = resolve(ROOT, "scripts/workflow_state.py");
 const DB_PATH = process.env.PI_CREATE_VIDEO_GUARD_DB
   ?? resolve(homedir(), ".pi/agent/state/create-video-guard.sqlite3");
-const stages = ["character_sheet", "storyboards", "clips", "final"] as const;
+const artifactStages = ["character_sheet", "storyboards", "clips", "final"] as const;
+const reviewStages = ["character_sheet", "cut_plan", "storyboards", "clips", "final"] as const;
 const verdicts = ["pass", "fail"] as const;
 
 interface StateResult {
@@ -151,12 +153,61 @@ export default function createVideoGuard(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "video_define_cut_plan",
+    label: "Define editorial cut plan",
+    description:
+      "Required after character-sheet approval and before storyboard generation. Decide the total number of editorial cuts and each 1–15 second cut duration from action density and story rhythm. Persist each cut's complete first-frame contents, full camera/environment/character action, and ordered local H3 generation segments. Cuts may be up to 15 seconds, but every local generation segment must be at most 5.2 seconds.",
+    parameters: Type.Object({
+      cuts: Type.Array(Type.Object({
+        id: Type.String({ minLength: 1, description: "Stable editorial cut id such as C01" }),
+        durationSeconds: Type.Number({ minimum: 1, maximum: 15, description: "Editorial cut duration; must match action density" }),
+        sceneId: Type.String({ minLength: 1 }),
+        startFrame: Type.Object({
+          scene: Type.String({ minLength: 1, description: "Complete location, background, weather, and environmental state visible in frame one" }),
+          characters: Type.String({ minLength: 1, description: "Every visible character, identity, costume, position, orientation, and count" }),
+          objects: Type.String({ minLength: 1, description: "Every important prop, foreground/midground/background object, and landmark" }),
+          characterPose: Type.String({ minLength: 1, description: "Exact body pose, feet, hands, weight, gaze, and contact state at frame one" }),
+          characterExpression: Type.String({ minLength: 1, description: "Exact facial expression and mouth/eye state at frame one" }),
+          composition: Type.String({ minLength: 1, description: "Framing, screen positions, depth layers, eyelines, and negative space" }),
+          camera: Type.String({ minLength: 1, description: "Initial shot size, viewpoint, height, angle, lens cues, and focus" }),
+          lighting: Type.String({ minLength: 1, description: "Light sources, direction, color temperature, contrast, and shadows" }),
+        }),
+        action: Type.Object({
+          cameraMovement: Type.String({ minLength: 1, description: "Movement type, direction/path, amplitude, speed, subject relationship, and endpoint" }),
+          sceneChanges: Type.String({ minLength: 1, description: "How environment, objects, weather, particles, and lighting evolve" }),
+          characterActions: Type.String({ minLength: 1, description: "Every character's ordered observable actions and interactions" }),
+          facialChanges: Type.String({ minLength: 1, description: "Ordered expression, gaze, blink, and mouth changes" }),
+          bodyMotion: Type.String({ minLength: 1, description: "Ordered pose, limb, hand, foot, torso, balance, and contact mechanics" }),
+          temporalProgression: Type.String({ minLength: 1, description: "Beginning, progression, turning point, and settle timing" }),
+          endState: Type.String({ minLength: 1, description: "Exact final frame scene, camera, pose, expression, objects, light, and sound state" }),
+          sound: Type.String({ minLength: 1, description: "Dialogue/lyrics, ambience, synchronized SFX, and music progression" }),
+        }),
+        generationSegments: Type.Array(Type.Object({
+          id: Type.String({ minLength: 1, description: "Stable generation segment id such as C01-G01" }),
+          startOffsetSeconds: Type.Number({ minimum: 0 }),
+          durationSeconds: Type.Number({ exclusiveMinimum: 0, maximum: 5.2 }),
+          continuation: StringEnum(["storyboard", "previous_last_frame"] as const, { description: "First segment is storyboard; later same-cut segments are previous_last_frame" }),
+          actionSlice: Type.String({ minLength: 1, description: "The observable subset of the cut action generated in this segment" }),
+          endState: Type.String({ minLength: 1, description: "Exact segment endpoint used to continue the next segment" }),
+          audioStartSeconds: Type.Optional(Type.Number({ minimum: 0, description: "Required for every MV segment" })),
+        }), { minItems: 1 }),
+      }), { minItems: 1 }),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const plan = cutPlanPayload(params);
+      return textResult(await runGuidedState(sessionId(ctx), [
+        "define-cut-plan", "--cut-plan-json", JSON.stringify(plan),
+      ]));
+    },
+  });
+
+  pi.registerTool({
     name: "video_submit_artifacts",
     label: "Submit video artifacts",
     description:
       "Submit only the stage named by workflow_guidance. Character sheets must be pure-white, one full-body view per character, with no duplicate views/insets/labels/swatches/crops. Submit the complete storyboard batch. For clips/final, submit first/middle/last and join QC contact sheets so visual inspection is possible.",
     parameters: Type.Object({
-      stage: StringEnum(stages),
+      stage: StringEnum(artifactStages),
       artifacts: Type.Array(Type.String({ description: "Absolute path to an existing visual artifact" }), { minItems: 1 }),
     }),
     async execute(_id, params, _signal, _update, ctx) {
@@ -178,9 +229,9 @@ export default function createVideoGuard(pi: ExtensionAPI) {
     name: "video_record_review",
     label: "Record visual review",
     description:
-      "Record a visual pass/fail only after inspecting every submitted artifact. Get the exact project-aware checklist from video_workflow status. MV singing clips add lyric, vocal-onset, M/B/P closure, rest-closure, mouth-visibility, and phrase-end checks; MV finals require original-song remux and timeline checks. Every required value is JSON boolean true/false; exact_character_count is a boolean match check, NEVER the number 1. Fail invalid art rather than retrying schemas or searching code.",
+      "Record the pending structured or visual pass/fail only after inspecting the current DB cut plan or every submitted artifact. Get the exact project-aware checklist from video_workflow status. Cut plans require justified count/durations, complete start frames/actions, contiguous generation-segment coverage, continuity, and exact total timing. MV singing clips add lyric, vocal-onset, M/B/P closure, rest-closure, mouth-visibility, and phrase-end checks; MV finals require original-song remux and timeline checks. Every required value is JSON boolean true/false; exact_character_count is a boolean match check, NEVER the number 1. Fail invalid work rather than retrying schemas or searching code.",
     parameters: Type.Object({
-      stage: StringEnum(stages),
+      stage: StringEnum(reviewStages),
       verdict: StringEnum(verdicts),
       checklistJson: Type.String({ description: "Copy the complete project-aware required_checklist from video_workflow status. Every check is JSON boolean true/false; exact_character_count is boolean (true when count matches), never numeric. Storyboard passes additionally require non-empty pairwise_evidence[] and sequence_style_evidence." }),
       reason: Type.String({ minLength: 1 }),

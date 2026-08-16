@@ -4,22 +4,25 @@
 import argparse
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
-STAGES = ("character_sheet", "storyboards", "clips", "final")
+ARTIFACT_STAGES = ("character_sheet", "storyboards", "clips", "final")
+REVIEW_STAGES = ("character_sheet", "cut_plan", "storyboards", "clips", "final")
 REQUIRED_STATE = {
     "character_sheet": {"treatment_approved", "character_sheet_review_failed"},
-    "storyboards": {"character_sheet_approved", "storyboards_review_failed"},
+    "storyboards": {"cut_plan_approved", "storyboards_review_failed"},
     "clips": {"storyboards_approved", "clips_review_failed"},
     "final": {"clips_approved", "final_review_failed"},
 }
 LOCK_MESSAGE_STATE = {
     "character_sheet": "treatment_approved",
-    "storyboards": "character_sheet_approved",
+    "storyboards": "cut_plan_approved",
     "clips": "storyboards_approved",
     "final": "clips_approved",
 }
@@ -29,6 +32,11 @@ CHECKLISTS = {
         "pure_white_background", "no_duplicates_or_extras",
         "single_view_per_character", "no_insets_labels_or_swatches",
         "anatomy_uncropped",
+    ),
+    "cut_plan": (
+        "cut_count_justified", "durations_match_action_density",
+        "duration_bounds_valid", "start_frames_complete", "actions_complete",
+        "segment_coverage_complete", "continuity_coherent", "total_duration_exact",
     ),
     "storyboards": (
         "all_planned_shots_present", "identity_consistent",
@@ -84,6 +92,26 @@ def fail(code: str, **details):
     raise SystemExit(2)
 
 
+def canonical_decimal_json(value):
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            f"{json.dumps(str(key), ensure_ascii=False)}:{canonical_decimal_json(value[key])}"
+            for key in sorted(value)
+        ) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(canonical_decimal_json(item) for item in value) + "]"
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("non-finite JSON number")
+        rendered = format(value, "f")
+        if "." in rendered:
+            rendered = rendered.rstrip("0").rstrip(".")
+        return "0" if rendered in ("-0", "") else rendered
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    raise TypeError(f"unsupported canonical JSON type: {type(value).__name__}")
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -107,10 +135,38 @@ def connect(db_path: Path) -> sqlite3.Connection:
             UNIQUE(session_id, version),
             FOREIGN KEY(session_id) REFERENCES workflow_sessions(session_id)
         );
+        CREATE TABLE IF NOT EXISTS cut_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            plan_json TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            cut_count INTEGER NOT NULL,
+            total_duration_seconds REAL NOT NULL,
+            total_duration_text TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(session_id, version),
+            FOREIGN KEY(session_id) REFERENCES workflow_sessions(session_id)
+        );
+        CREATE TABLE IF NOT EXISTS cut_plan_items (
+            session_id TEXT NOT NULL,
+            plan_version INTEGER NOT NULL,
+            cut_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            duration_seconds REAL NOT NULL,
+            duration_seconds_text TEXT,
+            scene_id TEXT NOT NULL,
+            start_frame_json TEXT NOT NULL,
+            action_json TEXT NOT NULL,
+            generation_segments_json TEXT NOT NULL,
+            PRIMARY KEY(session_id, plan_version, cut_id),
+            FOREIGN KEY(session_id) REFERENCES workflow_sessions(session_id)
+        );
         CREATE TABLE IF NOT EXISTS stage_artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
             stage TEXT NOT NULL,
+            artifact_key TEXT,
             path TEXT NOT NULL,
             sha256 TEXT NOT NULL,
             submitted_at TEXT NOT NULL,
@@ -139,6 +195,21 @@ def connect(db_path: Path) -> sqlite3.Connection:
         );
         """
     )
+    artifact_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(stage_artifacts)").fetchall()
+    }
+    if "artifact_key" not in artifact_columns:
+        conn.execute("ALTER TABLE stage_artifacts ADD COLUMN artifact_key TEXT")
+    cut_plan_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(cut_plans)").fetchall()
+    }
+    if "total_duration_text" not in cut_plan_columns:
+        conn.execute("ALTER TABLE cut_plans ADD COLUMN total_duration_text TEXT")
+    cut_item_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(cut_plan_items)").fetchall()
+    }
+    if "duration_seconds_text" not in cut_item_columns:
+        conn.execute("ALTER TABLE cut_plan_items ADD COLUMN duration_seconds_text TEXT")
     return conn
 
 
@@ -189,13 +260,67 @@ def command_status(conn, session_id):
     ).fetchone()
     if treatment:
         brief = json.loads(treatment["brief_json"])
+        exact_brief = json.loads(
+            treatment["brief_json"],
+            parse_float=Decimal,
+            parse_int=Decimal,
+            parse_constant=Decimal,
+        )
+        for shot, exact_shot in zip(brief["shot_manifest"], exact_brief["shot_manifest"]):
+            shot["duration_seconds_exact"] = canonical_decimal_json(exact_shot["duration_seconds"])
+            if "audio_start_seconds" in exact_shot:
+                shot["audio_start_seconds_exact"] = canonical_decimal_json(exact_shot["audio_start_seconds"])
+        target_exact = canonical_decimal_json(exact_brief["target_duration_seconds"])
         result.update({
             "treatment_version": treatment["version"],
             "treatment_sha256": treatment["sha256"],
             "project_type": brief["project_type"],
             "target_duration_seconds": brief["target_duration_seconds"],
+            "target_duration_seconds_exact": target_exact,
             "shot_count": len(brief["shot_manifest"]),
             "production_brief": brief,
+        })
+    cut_plan_row = conn.execute(
+        "SELECT version, plan_json, sha256, cut_count, total_duration_seconds, total_duration_text FROM cut_plans "
+        "WHERE session_id = ? ORDER BY version DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if cut_plan_row:
+        item_rows = conn.execute(
+            "SELECT cut_id, duration_seconds, duration_seconds_text, scene_id, start_frame_json, action_json, generation_segments_json "
+            "FROM cut_plan_items WHERE session_id = ? AND plan_version = ? ORDER BY ordinal",
+            (session_id, cut_plan_row["version"]),
+        ).fetchall()
+        queried_cuts = []
+        for item in item_rows:
+            segments = json.loads(item["generation_segments_json"])
+            exact_segments = json.loads(
+                item["generation_segments_json"],
+                parse_float=str,
+                parse_int=str,
+            )
+            for segment, exact_segment in zip(segments, exact_segments):
+                segment["start_offset_seconds_exact"] = str(exact_segment["start_offset_seconds"])
+                segment["duration_seconds_exact"] = str(exact_segment["duration_seconds"])
+                if "audio_start_seconds" in exact_segment:
+                    segment["audio_start_seconds_exact"] = str(exact_segment["audio_start_seconds"])
+            queried_cuts.append({
+                "id": item["cut_id"],
+                "duration_seconds": item["duration_seconds"],
+                "duration_seconds_exact": item["duration_seconds_text"] or str(item["duration_seconds"]),
+                "scene_id": item["scene_id"],
+                "start_frame": json.loads(item["start_frame_json"]),
+                "action": json.loads(item["action_json"]),
+                "generation_segments": segments,
+            })
+        queried_plan = {"cuts": queried_cuts}
+        result.update({
+            "cut_plan_version": cut_plan_row["version"],
+            "cut_plan_sha256": cut_plan_row["sha256"],
+            "cut_count": cut_plan_row["cut_count"],
+            "cut_plan_total_duration_seconds": cut_plan_row["total_duration_seconds"],
+            "cut_plan_total_duration_seconds_exact": cut_plan_row["total_duration_text"] or str(cut_plan_row["total_duration_seconds"]),
+            "cut_plan": queried_plan,
         })
     return result
 
@@ -222,7 +347,7 @@ def latest_production_brief(conn, session_id):
     return json.loads(row["brief_json"]) if row else None
 
 
-def validate_production_brief(brief):
+def validate_production_brief(brief, exact_brief):
     required = (
         "user_request", "project_type", "target_duration_seconds", "explicit_requirements",
         "agent_assumptions", "creative_choices", "treatment", "shot_manifest",
@@ -247,8 +372,13 @@ def validate_production_brief(brief):
             detail="agent_assumptions must contain assumption, basis, and low/medium/high confidence",
         )
     target = brief["target_duration_seconds"]
-    if not isinstance(target, (int, float)) or isinstance(target, bool) or target <= 0:
-        fail("invalid_production_brief", detail="target_duration_seconds must be positive")
+    exact_target = exact_brief["target_duration_seconds"]
+    if (
+        not isinstance(target, (int, float)) or isinstance(target, bool)
+        or not math.isfinite(target) or target <= 0
+        or not exact_target.is_finite() or exact_target <= Decimal("0")
+    ):
+        fail("invalid_production_brief", detail="target_duration_seconds must be a finite positive number")
     shots = brief["shot_manifest"]
     if not isinstance(shots, list) or not shots:
         fail("invalid_production_brief", detail="shot_manifest must contain at least one shot")
@@ -258,6 +388,7 @@ def validate_production_brief(brief):
         or not isinstance(shot.get("beat"), str) or not shot["beat"].strip()
         or not isinstance(shot.get("duration_seconds"), (int, float))
         or isinstance(shot.get("duration_seconds"), bool)
+        or not math.isfinite(shot["duration_seconds"])
         or shot["duration_seconds"] <= 0
         for shot in shots
     ):
@@ -265,9 +396,20 @@ def validate_production_brief(brief):
     shot_ids = [shot["id"] for shot in shots]
     if len(set(shot_ids)) != len(shot_ids):
         fail("invalid_production_brief", detail="shot ids must be unique")
-    if abs(sum(shot["duration_seconds"] for shot in shots) - target) > 0.05:
-        fail("invalid_production_brief", detail="shot durations must sum to target_duration_seconds")
-    if any(shot["duration_seconds"] > 5.2 for shot in shots):
+    exact_shots = exact_brief["shot_manifest"]
+    if any(
+        not shot["duration_seconds"].is_finite()
+        or shot["duration_seconds"] <= Decimal("0")
+        for shot in exact_shots
+    ):
+        fail("invalid_production_brief", detail="each shot duration_seconds must be a finite positive number")
+    exact_shot_total = sum(
+        (shot["duration_seconds"] for shot in exact_shots),
+        Decimal("0"),
+    )
+    if exact_shot_total != exact_target:
+        fail("invalid_production_brief", detail="shot durations must sum exactly to target_duration_seconds")
+    if any(shot["duration_seconds"] > Decimal("5.2") for shot in exact_shots):
         fail(
             "invalid_production_brief",
             detail="each H3 segment must be at most 5.2 seconds; split longer action into variable-duration segments and set later same-scene segments to continuation=previous_last_frame",
@@ -335,6 +477,7 @@ def validate_production_brief(brief):
         or generation_lock["steps"] <= 0
         or not isinstance(generation_lock.get("cfg"), (int, float))
         or isinstance(generation_lock.get("cfg"), bool)
+        or not math.isfinite(generation_lock["cfg"])
         or generation_lock["cfg"] <= 0
     ):
         fail(
@@ -351,10 +494,13 @@ def validate_production_brief(brief):
         if any(
             not isinstance(shot.get("audio_start_seconds"), (int, float))
             or isinstance(shot.get("audio_start_seconds"), bool)
-            or shot["audio_start_seconds"] < 0
-            or shot["duration_seconds"] < 2
-            or shot["duration_seconds"] > 5.2
+            or not math.isfinite(shot["audio_start_seconds"])
             for shot in shots
+        ) or any(
+            shot.get("audio_start_seconds", Decimal("-1")) < 0
+            or shot["duration_seconds"] < Decimal("2")
+            or shot["duration_seconds"] > Decimal("5.2")
+            for shot in exact_shots
         ):
             fail(
                 "invalid_production_brief",
@@ -396,14 +542,33 @@ def command_define_brief(conn, session_id, brief_json):
     row = get_row(conn, session_id)
     if row is None:
         fail("workflow_not_started")
+    if row["state"] != "brief":
+        fail(
+            "stage_locked",
+            current_state=row["state"],
+            required_state="brief",
+            recovery="The production brief is locked once dependent stages begin; start a new session for a different treatment",
+        )
     try:
         brief = json.loads(brief_json)
-    except json.JSONDecodeError as exc:
+        exact_brief = json.loads(
+            brief_json,
+            parse_float=Decimal,
+            parse_int=Decimal,
+            parse_constant=Decimal,
+        )
+    except (json.JSONDecodeError, ArithmeticError) as exc:
         fail("invalid_production_brief", detail=str(exc))
     if not isinstance(brief, dict):
         fail("invalid_production_brief", detail="brief must be an object")
-    validate_production_brief(brief)
-    canonical = json.dumps(brief, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    validate_production_brief(brief, exact_brief)
+    if brief["project_type"] == "mv":
+        exact_brief["source_audio_path"] = brief["source_audio_path"]
+        exact_brief["source_audio_sha256"] = brief["source_audio_sha256"]
+    try:
+        canonical = canonical_decimal_json(exact_brief)
+    except (TypeError, ValueError) as exc:
+        fail("invalid_production_brief", detail=str(exc))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     previous = conn.execute(
         "SELECT COALESCE(MAX(version), 0) FROM production_treatments WHERE session_id = ?",
@@ -430,6 +595,204 @@ def command_define_brief(conn, session_id, brief_json):
     return result
 
 
+def validate_cut_plan(plan, brief, exact_plan, exact_target):
+    if not isinstance(plan, dict) or not isinstance(plan.get("cuts"), list) or not plan["cuts"]:
+        fail("invalid_cut_plan", detail="cut plan requires a non-empty cuts array")
+    cuts = plan["cuts"]
+    start_fields = (
+        "scene", "characters", "objects", "character_pose", "character_expression",
+        "composition", "camera", "lighting",
+    )
+    action_fields = (
+        "camera_movement", "scene_changes", "character_actions", "facial_changes",
+        "body_motion", "temporal_progression", "end_state", "sound",
+    )
+    exact_cuts = exact_plan["cuts"]
+    cut_ids = []
+    segment_ids = []
+    for cut, exact_cut in zip(cuts, exact_cuts):
+        if (
+            not isinstance(cut, dict)
+            or not isinstance(cut.get("id"), str) or not cut["id"].strip()
+            or not isinstance(cut.get("scene_id"), str) or not cut["scene_id"].strip()
+        ):
+            fail("invalid_cut_plan", detail="every cut requires non-empty id and scene_id")
+        duration = cut.get("duration_seconds")
+        if (
+            not isinstance(duration, (int, float)) or isinstance(duration, bool)
+            or not math.isfinite(duration)
+        ):
+            fail("invalid_cut_plan", detail="every editorial cut duration must be a finite number within 1–15 seconds")
+        duration_decimal = exact_cut["duration_seconds"]
+        if not duration_decimal.is_finite():
+            fail("invalid_cut_plan", detail="every editorial cut duration must be a finite number within 1–15 seconds")
+        if duration_decimal < Decimal("1") or duration_decimal > Decimal("15"):
+            fail("invalid_cut_plan", detail="every editorial cut duration must be within 1–15 seconds")
+        cut_ids.append(cut["id"])
+        start_frame = cut.get("start_frame")
+        if (
+            not isinstance(start_frame, dict)
+            or any(not isinstance(start_frame.get(key), str) or not start_frame[key].strip()
+                   for key in start_fields)
+        ):
+            fail(
+                "invalid_cut_plan",
+                detail="every start_frame requires scene, characters, objects, character_pose, character_expression, composition, camera, and lighting",
+            )
+        action = cut.get("action")
+        if (
+            not isinstance(action, dict)
+            or any(not isinstance(action.get(key), str) or not action[key].strip()
+                   for key in action_fields)
+        ):
+            fail(
+                "invalid_cut_plan",
+                detail="every action requires camera_movement, scene_changes, character_actions, facial_changes, body_motion, temporal_progression, end_state, and sound",
+            )
+        segments = cut.get("generation_segments")
+        if not isinstance(segments, list) or not segments:
+            fail("invalid_cut_plan", detail="every cut requires at least one generation segment")
+        exact_segments = exact_cut["generation_segments"]
+        expected_offset = Decimal("0")
+        for index, (segment, exact_segment) in enumerate(zip(segments, exact_segments)):
+            if (
+                not isinstance(segment, dict)
+                or not isinstance(segment.get("id"), str) or not segment["id"].strip()
+                or not isinstance(segment.get("action_slice"), str) or not segment["action_slice"].strip()
+                or not isinstance(segment.get("end_state"), str) or not segment["end_state"].strip()
+            ):
+                fail("invalid_cut_plan", detail="every generation segment requires id, action_slice, and end_state")
+            segment_duration = segment.get("duration_seconds")
+            offset = segment.get("start_offset_seconds")
+            exact_segment_duration = exact_segment["duration_seconds"]
+            exact_offset = exact_segment["start_offset_seconds"]
+            if (
+                not isinstance(segment_duration, (int, float)) or isinstance(segment_duration, bool)
+                or not math.isfinite(segment_duration)
+                or not exact_segment_duration.is_finite()
+                or exact_segment_duration <= Decimal("0")
+                or exact_segment_duration > Decimal("5.2")
+            ):
+                fail("invalid_cut_plan", detail="every local H3 generation segment must be a finite positive number at most 5.2 seconds")
+            if (
+                not isinstance(offset, (int, float)) or isinstance(offset, bool)
+                or not math.isfinite(offset)
+                or not exact_offset.is_finite()
+                or exact_offset != expected_offset
+            ):
+                fail("invalid_cut_plan", detail="generation segments must be exactly contiguous from start_offset_seconds=0")
+            expected_continuation = "storyboard" if index == 0 else "previous_last_frame"
+            if segment.get("continuation") != expected_continuation:
+                fail(
+                    "invalid_cut_plan",
+                    detail="the first generation segment must use continuation=storyboard and later segments previous_last_frame",
+                )
+            if brief.get("project_type") == "mv" and (
+                not isinstance(segment.get("audio_start_seconds"), (int, float))
+                or isinstance(segment.get("audio_start_seconds"), bool)
+                or not math.isfinite(segment["audio_start_seconds"])
+                or not exact_segment["audio_start_seconds"].is_finite()
+                or exact_segment["audio_start_seconds"] < Decimal("0")
+            ):
+                fail("invalid_cut_plan", detail="every MV generation segment requires audio_start_seconds")
+            segment_ids.append(segment["id"])
+            expected_offset += exact_segment_duration
+        if expected_offset != duration_decimal:
+            fail("invalid_cut_plan", detail="generation segment durations must sum exactly to their editorial cut duration")
+    if len(cut_ids) != len(set(cut_ids)):
+        fail("invalid_cut_plan", detail="cut ids must be unique")
+    if len(segment_ids) != len(set(segment_ids)):
+        fail("invalid_cut_plan", detail="generation segment ids must be unique")
+    cut_total = sum((cut["duration_seconds"] for cut in exact_cuts), Decimal("0"))
+    if cut_total != exact_target:
+        fail("invalid_cut_plan", detail="editorial cut durations must sum exactly to target_duration_seconds")
+
+
+def command_define_cut_plan(conn, session_id, cut_plan_json):
+    row = get_row(conn, session_id)
+    if row is None:
+        fail("workflow_not_started")
+    if row["state"] not in ("character_sheet_approved", "cut_plan_review_failed"):
+        fail(
+            "stage_locked",
+            current_state=row["state"],
+            required_state="character_sheet_approved",
+            recovery="Call video_workflow status and execute only workflow_guidance.next_tool",
+        )
+    try:
+        plan = json.loads(cut_plan_json)
+        exact_plan = json.loads(
+            cut_plan_json,
+            parse_float=Decimal,
+            parse_int=Decimal,
+            parse_constant=Decimal,
+        )
+    except (json.JSONDecodeError, ArithmeticError) as exc:
+        fail("invalid_cut_plan", detail=str(exc))
+    brief_row = conn.execute(
+        "SELECT brief_json FROM production_treatments WHERE session_id = ? ORDER BY version DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if brief_row is None:
+        fail("invalid_cut_plan", detail="a locked production brief is required")
+    brief = json.loads(brief_row["brief_json"])
+    exact_brief = json.loads(
+        brief_row["brief_json"],
+        parse_float=Decimal,
+        parse_int=Decimal,
+        parse_constant=Decimal,
+    )
+    validate_cut_plan(plan, brief, exact_plan, exact_brief["target_duration_seconds"])
+    try:
+        canonical = canonical_decimal_json(exact_plan)
+    except (TypeError, ValueError) as exc:
+        fail("invalid_cut_plan", detail=str(exc))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    previous = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM cut_plans WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()[0]
+    version = previous + 1
+    timestamp = now()
+    exact_total = sum(
+        (cut["duration_seconds"] for cut in exact_plan["cuts"]),
+        Decimal("0"),
+    )
+    exact_total_text = canonical_decimal_json(exact_total)
+    total = float(exact_total)
+    conn.execute(
+        "INSERT INTO cut_plans(session_id,version,plan_json,sha256,cut_count,total_duration_seconds,total_duration_text,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (session_id, version, canonical, digest, len(plan["cuts"]), total, exact_total_text, timestamp),
+    )
+    for ordinal, cut in enumerate(plan["cuts"], start=1):
+        conn.execute(
+            "INSERT INTO cut_plan_items(session_id,plan_version,cut_id,ordinal,duration_seconds,duration_seconds_text,scene_id,start_frame_json,action_json,generation_segments_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                session_id, version, cut["id"], ordinal, cut["duration_seconds"],
+                canonical_decimal_json(exact_plan["cuts"][ordinal - 1]["duration_seconds"]), cut["scene_id"],
+                json.dumps(cut["start_frame"], ensure_ascii=False, sort_keys=True),
+                json.dumps(cut["action"], ensure_ascii=False, sort_keys=True),
+                canonical_decimal_json(exact_plan["cuts"][ordinal - 1]["generation_segments"]),
+            ),
+        )
+    transition(
+        conn, session_id, "define_cut_plan", row["state"], "cut_plan_pending_review",
+        {"version": version, "sha256": digest, "cut_count": len(plan["cuts"]), "total_duration_seconds_exact": exact_total_text},
+    )
+    conn.commit()
+    return {
+        "session_id": session_id,
+        "state": "cut_plan_pending_review",
+        "version": version,
+        "sha256": digest,
+        "cut_count": len(plan["cuts"]),
+        "total_duration_seconds": total,
+        "total_duration_seconds_exact": exact_total_text,
+    }
+
+
 def file_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -444,15 +807,6 @@ def command_submit(conn, session_id, stage, artifacts):
         fail("workflow_not_started")
     state = row["state"]
     required_states = set(REQUIRED_STATE[stage])
-    brief = latest_production_brief(conn, session_id)
-    if stage == "storyboards" and brief and storyboard_policy(brief)["mode"] == "direct":
-        fail(
-            "storyboards_not_required",
-            current_state=state,
-            recovery="Generate H3 segments directly and seed same-scene continuations from the previous clip's actual last frame",
-        )
-    if stage == "clips" and brief and storyboard_policy(brief)["mode"] == "direct":
-        required_states.add("character_sheet_approved")
     if state not in required_states:
         fail(
             "stage_locked",
@@ -461,19 +815,59 @@ def command_submit(conn, session_id, stage, artifacts):
             recovery="Call video_workflow status and execute only workflow_guidance.next_tool",
         )
 
+    artifact_keys = [None] * len(artifacts)
+    if stage == "storyboards":
+        plan_row = conn.execute(
+            "SELECT version FROM cut_plans WHERE session_id = ? ORDER BY version DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if plan_row is None:
+            fail("stage_locked", current_state=state, required_state="cut_plan_approved")
+        cut_ids = [
+            item["cut_id"] for item in conn.execute(
+                "SELECT cut_id FROM cut_plan_items WHERE session_id = ? AND plan_version = ? ORDER BY ordinal",
+                (session_id, plan_row["version"]),
+            ).fetchall()
+        ]
+        if len(artifacts) != len(cut_ids):
+            fail(
+                "incomplete_storyboard_coverage",
+                expected_cut_ids=cut_ids,
+                received_artifact_count=len(artifacts),
+                detail="submit exactly one storyboard artifact per editorial cut in cut-plan order",
+            )
+        artifact_keys = cut_ids
+        resolved_storyboards = [str(Path(path).expanduser().resolve()) for path in artifacts]
+        if len(set(resolved_storyboards)) != len(resolved_storyboards):
+            fail(
+                "duplicate_storyboard_artifact",
+                detail="each editorial cut requires a distinct storyboard file",
+            )
+
     artifact_rows = []
-    for raw_path in artifacts:
+    for raw_path, artifact_key in zip(artifacts, artifact_keys):
         path = Path(raw_path).expanduser().resolve()
         if not path.is_file():
             fail("artifact_not_found", path=str(path))
-        artifact_rows.append({"path": str(path), "sha256": file_hash(path)})
+        artifact_rows.append({
+            "path": str(path),
+            "sha256": file_hash(path),
+            **({"cut_id": artifact_key} if artifact_key is not None else {}),
+        })
+    if stage == "storyboards":
+        storyboard_hashes = [artifact["sha256"] for artifact in artifact_rows]
+        if len(set(storyboard_hashes)) != len(storyboard_hashes):
+            fail(
+                "duplicate_storyboard_content",
+                detail="each editorial cut requires visually distinct storyboard file content; duplicate SHA256 values are not allowed",
+            )
 
     timestamp = now()
     conn.execute("DELETE FROM stage_artifacts WHERE session_id = ? AND stage = ?", (session_id, stage))
     for artifact in artifact_rows:
         conn.execute(
-            "INSERT INTO stage_artifacts(session_id,stage,path,sha256,submitted_at) VALUES(?,?,?,?,?)",
-            (session_id, stage, artifact["path"], artifact["sha256"], timestamp),
+            "INSERT INTO stage_artifacts(session_id,stage,artifact_key,path,sha256,submitted_at) VALUES(?,?,?,?,?,?)",
+            (session_id, stage, artifact.get("cut_id"), artifact["path"], artifact["sha256"], timestamp),
         )
     new_state = f"{stage}_pending_review"
     transition(conn, session_id, "submit", state, new_state, {"artifacts": artifact_rows})
@@ -496,6 +890,30 @@ def command_review(conn, session_id, stage, verdict, checklist_json, reason, rev
         fail("invalid_checklist", detail="checklist must be an object")
 
     if verdict == "pass":
+        if stage == "storyboards":
+            plan_row = conn.execute(
+                "SELECT version FROM cut_plans WHERE session_id = ? ORDER BY version DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            expected_cut_ids = [
+                item["cut_id"] for item in conn.execute(
+                    "SELECT cut_id FROM cut_plan_items WHERE session_id = ? AND plan_version = ? ORDER BY ordinal",
+                    (session_id, plan_row["version"]),
+                ).fetchall()
+            ] if plan_row else []
+            submitted_cut_ids = [
+                item["artifact_key"] for item in conn.execute(
+                    "SELECT artifact_key FROM stage_artifacts WHERE session_id = ? AND stage = 'storyboards' ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            ]
+            if submitted_cut_ids != expected_cut_ids:
+                fail(
+                    "incomplete_storyboard_coverage",
+                    expected_cut_ids=expected_cut_ids,
+                    submitted_cut_ids=submitted_cut_ids,
+                    detail="storyboard review requires exactly one persisted artifact for every editorial cut",
+                )
         brief = latest_production_brief(conn, session_id)
         required_fields = required_checklist(brief, stage)
         missing = [field for field in required_fields if checklist.get(field) is not True]
@@ -556,11 +974,13 @@ def parse_args():
     sub.add_parser("status")
     define_brief = sub.add_parser("define-brief")
     define_brief.add_argument("--brief-json", required=True)
+    define_cut_plan = sub.add_parser("define-cut-plan")
+    define_cut_plan.add_argument("--cut-plan-json", required=True)
     submit = sub.add_parser("submit")
-    submit.add_argument("--stage", choices=STAGES, required=True)
+    submit.add_argument("--stage", choices=ARTIFACT_STAGES, required=True)
     submit.add_argument("--artifact", action="append", required=True)
     review = sub.add_parser("review")
-    review.add_argument("--stage", choices=STAGES, required=True)
+    review.add_argument("--stage", choices=REVIEW_STAGES, required=True)
     review.add_argument("--verdict", choices=("pass", "fail"), required=True)
     review.add_argument("--checklist-json", required=True)
     review.add_argument("--reason", required=True)
@@ -578,6 +998,8 @@ def main():
             result = command_status(conn, args.session)
         elif args.command == "define-brief":
             result = command_define_brief(conn, args.session, args.brief_json)
+        elif args.command == "define-cut-plan":
+            result = command_define_cut_plan(conn, args.session, args.cut_plan_json)
         elif args.command == "submit":
             result = command_submit(conn, args.session, args.stage, args.artifact)
         else:
