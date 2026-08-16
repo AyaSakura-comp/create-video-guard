@@ -1,0 +1,9 @@
+{
+  "name": "create-video-guard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/extension_core.test.mjs && python3 -m unittest -v tests/test_workflow_state.py"
+  }
+}
